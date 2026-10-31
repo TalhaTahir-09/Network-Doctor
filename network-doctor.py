@@ -1,51 +1,57 @@
 print("Starting Engine..")
-from scapy.all import IP, ICMP, sr1, conf, ls
+from scapy.all import IP, ICMP, sr1, conf
 import math
+import time
+
 gateway = conf.route.route("0.0.0.0")[2]
 
+
 def pingFn(des):
-    if(des == "0.0.0.0"):
-        return "Can't access router, Check physical layer"
-    else:
-        pkt = IP(dst=des) / ICMP()
-        # print("Pkt LIST")
-        # print(ls(pkt[ICMP]))
 
-        res = sr1(pkt, timeout=5, verbose=0)
-        # print("REs LIST")
+    pkt = IP(dst=des) / ICMP()
 
-        # print(ls(res[ICMP]))
+    start = time.perf_counter()
+    res = sr1(pkt, timeout=5, verbose=0)
+    end = time.perf_counter()
 
-        # Validation Code
-        score = 0
-        # IP Layer
-        if(pkt.src == res.dst and pkt.dst == res.src):
-            print("Source and Destination Matches!!")
-            score+=1
-        else:  
-            print("Packet did not arrive from the requested destination")
+    # Handle timeout
+    if res is None:
+        return {
+            "success": False,
+            "reason": "timeout",
+            "latency": None
+        }
 
-        # ICMP Layer
-        if(res.type == 0 and res.code == 0):
-            print("ICMP Type and code are good")
-            score+=1
-            if(pkt[ICMP].id == res[ICMP].id ):
-                print("Id of the packet mactches!!")
-                score+=1
-                if(pkt.seq == res.seq):
-                    print("Packet Sequence matches!!")
-                    score+=1
-                else:
-                    print("Packet Sequence has been manipulated")
-            else:
-                print("Packet id does not match")
-        else:
-            print("ICMP code and type are not correct")
-        
-        if res:
-            return [bool(res), f"{math.ceil(10**3*(res.time - pkt.time))}ms"]
-        else:
-            return [False]
+    # Check packet structure
+    if not res.haslayer(IP) or not res.haslayer(ICMP):
+        return {
+            "success": False,
+            "reason": "unexpected packet",
+            "latency": None
+        }
+
+    # Validation Code
+    resDict = {"success": False, "checks": {}}
+    checks = {}
+
+    # IP validation
+    checks["ip"] = (
+        pkt[IP].src == res[IP].dst
+        and pkt[IP].dst == res[IP].src
+    )
+
+    # ICMP validation
+    checks["icmp_type"] = res[ICMP].type == 0
+    checks["icmp_code"] = res[ICMP].code == 0
+    checks["id"] = pkt[ICMP].id == res[ICMP].id
+    checks["sequence"] = pkt[ICMP].seq == res[ICMP].seq
+
+    # Overall success
+    resDict["checks"] = checks
+    resDict["success"] = all(checks.values())
+    resDict["latency"] = f"{math.ceil((end - start) * 1000)}ms"
+
+    return resDict
 
 print(pingFn(gateway))
 # print(f"Gateway IP: {gateway}")
