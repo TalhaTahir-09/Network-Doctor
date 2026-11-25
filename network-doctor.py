@@ -1,5 +1,5 @@
 print("Starting Engine..")
-from scapy.all import ICMP, IP, UDP, DNS, DNSQR, DNSRR, sr1, conf, ls
+from scapy.all import ICMP, IP, UDP, DNS, DNSQR, DNSRR, sr1, conf, ls, TCP, send
 import math
 import secrets
 import time
@@ -23,7 +23,6 @@ def dnsFn(domain, dns_server="8.8.8.8", record_type="A", timeout=5):
         }
 
     qtype = record_types[record_type]
-    print(qtype)
 
     # Find the local source IP
     route = conf.route.route(dns_server)
@@ -38,8 +37,8 @@ def dnsFn(domain, dns_server="8.8.8.8", record_type="A", timeout=5):
     # transaction ID and source port
     transaction_id = secrets.randbelow(65536)
     source_port = secrets.randbelow(16384) + 49152
-    print("Transaction Id:", transaction_id)
-    print("Source Port:", source_port)
+    # print("Transaction Id:", transaction_id)
+    # print("Source Port:", source_port)
 
 
     # Construct DNS query
@@ -93,7 +92,7 @@ def dnsFn(domain, dns_server="8.8.8.8", record_type="A", timeout=5):
         }
 
     response = res[DNS]
-    print(ls(response))
+    # print(ls(response))
     # normalize domain names for comparison
     def normalize_name(name):
         if isinstance(name, bytes):
@@ -229,16 +228,16 @@ def dnsFn(domain, dns_server="8.8.8.8", record_type="A", timeout=5):
 
 
 # DNS tests
-print("Starting DNS Diagnostics...")
+# print("Starting DNS Diagnostics...")
 
-print("\n--- GOOGLE A RECORD ---")
-print(dnsFn("google.com"))
+# print("\n--- GOOGLE A RECORD ---")
+# print(dnsFn("google.com"))
 
-print("\n--- GOOGLE AAAA RECORD ---")
-print(dnsFn("google.com", record_type="AAAA"))
+# print("\n--- GOOGLE AAAA RECORD ---")
+# print(dnsFn("google.com", record_type="AAAA"))
 
-print("\n--- NONEXISTENT DOMAIN ---")
-print(dnsFn("network-doctor-test.invalid"))
+# print("\n--- NONEXISTENT DOMAIN ---")
+# print(dnsFn("network-doctor-test.invalid"))
 
 def pingFn(des):
 
@@ -296,7 +295,118 @@ def pingFn(des):
 
     return resDict
 
-print(pingFn(gateway))
+def tcpFn(des, port=443, timeout=5):
+
+    route = conf.route.route(des)
+    source_ip = route[1]
+
+    if not source_ip or source_ip == "0.0.0.0":
+        return {
+            "success": False,
+            "reason": "no valid route",
+            "latency_ms": None
+        }
+
+    source_port = secrets.randbelow(16384) + 49152
+    sequence = secrets.randbelow(2**32)
+
+    pkt = (
+        IP(src=source_ip, dst=des) /
+        TCP(
+            sport=source_port,
+            dport=port,
+            flags="S",
+            seq=sequence
+        )
+    )
+
+    start = time.perf_counter()
+    res = sr1(pkt, timeout=timeout, verbose=0)
+    end = time.perf_counter()
+
+    latency = round((end - start) * 1000, 2)
+
+    if res is None:
+        return {
+            "success": False,
+            "response_valid": False,
+            "reason": "timeout",
+            "latency_ms": latency
+        }
+
+    if not res.haslayer(IP) or not res.haslayer(TCP):
+        return {
+            "success": False,
+            "response_valid": False,
+            "reason": "unexpected packet",
+            "latency_ms": latency
+        }
+
+    ip_res = res[IP]
+    tcp_res = res[TCP]
+
+    checks = {
+        "source_ip": ip_res.src == des,
+        "destination_ip": ip_res.dst == source_ip,
+        "source_port": tcp_res.sport == port,
+        "destination_port": tcp_res.dport == source_port,
+        "acknowledgment": tcp_res.ack == ((sequence + 1) % (2**32))
+    }
+
+
+    response_valid = all(checks.values())
+
+    if not response_valid:
+        reason = "invalid TCP response"
+        success = False
+
+    elif tcp_res.flags & 0x04:
+        reason = "connection refused (RST)"
+        success = False
+
+    elif (tcp_res.flags & 0x12) == 0x12:
+        reason = "TCP connection established (SYN-ACK)"
+        success = True
+
+        # Complete the handshake with the final ACK.
+        ack_pkt = (
+            IP(src=source_ip, dst=des) /
+            TCP(
+                sport=source_port,
+                dport=port,
+                flags="A",
+                seq=(sequence + 1) % (2**32),
+                ack=(tcp_res.seq + 1) % (2**32)
+            )
+        )
+        print(ls(ack_pkt))
+
+
+        send(ack_pkt, verbose=0)
+
+    else:
+        reason = "unexpected TCP flags"
+        success = False
+
+    return {
+        "success": success,
+        "response_valid": response_valid,
+        "reason": reason,
+        "server": des,
+        "port": port,
+        "latency_ms": latency,
+        "checks": checks,
+        "tcp_flags": str(tcp_res.flags)
+    }
+# HTTPS
+print(tcpFn("142.250.202.238", 443))
+
+# HTTP
+# print(tcpFn("142.250.202.238", 80))
+
+# A likely closed port
+# print(tcpFn("142.250.202.238", 65000))
+# print(pingFn(gateway))
 # print(f"Gateway IP: {gateway}")
 # print(pingFn(gateway))
-print(pingFn("8.8.8.8"))
+# print(pingFn("8.8.8.8"))
