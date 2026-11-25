@@ -1,14 +1,174 @@
-print("Starting Engine..")
-from scapy.all import ICMP, IP, UDP, DNS, DNSQR, DNSRR, sr1, conf, ls, TCP, send
-import math
+"""
+Network Doctor v1.0
+A small, practical network diagnostic tool.
+
+Checks:
+1. Default gateway reachability (ICMP)
+2. External IP reachability (ICMP)
+3. DNS A-record resolution
+4. TCP connection to port 443
+5. TLS handshake and certificate verification
+
+Requirements:
+    pip install scapy
+
+Run from an elevated/admin terminal if Scapy requires packet-capture privileges.
+"""
+
+from scapy.all import IP, ICMP, UDP, DNS, DNSQR, sr1, conf
+
 import secrets
+import socket
+import ssl
 import time
 
-gateway = conf.route.route("0.0.0.0")[2]
 
-def dnsFn(domain, dns_server="8.8.8.8", record_type="A", timeout=5):
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-    # Validate requested record type
+DNS_SERVER = "8.8.8.8"
+INTERNET_TEST_IP = "1.1.1.1"
+HTTPS_PORT = 443
+DEFAULT_TIMEOUT = 5
+TEST_DOMAIN = "google.com"
+
+
+# ============================================================
+# SHARED HELPERS
+# ============================================================
+
+def make_result(success, reason, **extra):
+    """Create a consistent result dictionary for every diagnostic."""
+    return {
+        "success": success,
+        "reason": reason,
+        **extra
+    }
+
+
+def make_failure(reason, **extra):
+    return make_result(False, reason, **extra)
+
+
+def get_source_ip(destination):
+    """Ask Scapy's routing table which local IPv4 address reaches destination."""
+    try:
+        route = conf.route.route(destination)
+        source_ip = route[1]
+
+        if not source_ip or source_ip == "0.0.0.0":
+            return None
+
+        return source_ip
+
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def has_layers(packet, *layers):
+    return packet is not None and all(
+        packet.haslayer(layer) for layer in layers
+    )
+
+
+def normalize_name(name):
+    if isinstance(name, bytes):
+        name = name.decode("ascii", errors="replace")
+
+    return str(name).rstrip(".").lower()
+
+
+def first_record(records):
+    """Scapy versions may expose a DNS question as one record or a list."""
+    if records is None:
+        return None
+
+    if isinstance(records, (list, tuple)):
+        return records[0] if records else None
+
+    return records
+
+
+def send_packet(packet, timeout=DEFAULT_TIMEOUT):
+    """Send one Scapy packet and return its response and elapsed time."""
+    start = time.perf_counter()
+
+    try:
+        response = sr1(packet, timeout=timeout, verbose=0)
+    except OSError as error:
+        return None, round((time.perf_counter() - start) * 1000, 2), str(error)
+
+    latency = round((time.perf_counter() - start) * 1000, 2)
+    return response, latency, None
+
+
+def print_check(title, result):
+    status = "PASS" if result.get("success") else "FAIL"
+    latency = result.get("latency_ms")
+
+    suffix = f" ({latency} ms)" if latency is not None else ""
+    print(f"[{status}] {title}{suffix}")
+    print(f"       {result.get('reason', 'No details')}")
+
+
+# ============================================================
+# 1. ICMP PING
+# ============================================================
+
+def pingFn(destination, timeout=DEFAULT_TIMEOUT):
+    source_ip = get_source_ip(destination)
+
+    if not source_ip:
+        return make_failure("No valid route to destination")
+
+    packet = IP(src=source_ip, dst=destination) / ICMP()
+    response, latency, send_error = send_packet(packet, timeout)
+
+    if send_error:
+        return make_failure(
+            f"Could not send ICMP packet: {send_error}",
+            latency_ms=latency
+        )
+
+    if response is None:
+        return make_failure("No ICMP reply before timeout", latency_ms=latency)
+
+    if not has_layers(response, IP, ICMP):
+        return make_failure("Received an unexpected packet", latency_ms=latency)
+
+    checks = {
+        "ip_addresses": (
+            packet[IP].src == response[IP].dst
+            and packet[IP].dst == response[IP].src
+        ),
+        "echo_reply_type": response[ICMP].type == 0,
+        "icmp_code": response[ICMP].code == 0,
+        "identifier": packet[ICMP].id == response[ICMP].id,
+        "sequence": packet[ICMP].seq == response[ICMP].seq
+    }
+
+    success = all(checks.values())
+
+    return make_result(
+        success,
+        "Ping reply validated" if success else "ICMP response validation failed",
+        destination=destination,
+        latency_ms=latency,
+        checks=checks
+    )
+
+
+# ============================================================
+# 2. DNS RESOLUTION
+# ============================================================
+
+def dnsFn(
+    domain,
+    dns_server=DNS_SERVER,
+    record_type="A",
+    timeout=DEFAULT_TIMEOUT
+):
     record_type = record_type.upper()
 
     record_types = {
@@ -16,33 +176,45 @@ def dnsFn(domain, dns_server="8.8.8.8", record_type="A", timeout=5):
         "AAAA": 28
     }
 
+    record_names = {
+        1: "A",
+        2: "NS",
+        5: "CNAME",
+        15: "MX",
+        16: "TXT",
+        28: "AAAA"
+    }
+
+    rcode_names = {
+        0: "NOERROR",
+        1: "FORMERR",
+        2: "SERVFAIL",
+        3: "NXDOMAIN",
+        4: "NOTIMP",
+        5: "REFUSED"
+    }
+
     if record_type not in record_types:
-        return {
-            "success": False,
-            "reason": "Unsupported record type. Use A or AAAA."
-        }
+        return make_failure(
+            "Unsupported record type; use A or AAAA",
+            response_valid=False,
+            answers=[]
+        )
+
+    source_ip = get_source_ip(dns_server)
+
+    if not source_ip:
+        return make_failure(
+            "No valid route to DNS server",
+            response_valid=False,
+            answers=[]
+        )
 
     qtype = record_types[record_type]
-
-    # Find the local source IP
-    route = conf.route.route(dns_server)
-    source_ip = route[1]
-
-    if not source_ip or source_ip == "0.0.0.0":
-        return {
-            "success": False,
-            "reason": "No valid route to DNS server"
-        }
-
-    # transaction ID and source port
     transaction_id = secrets.randbelow(65536)
     source_port = secrets.randbelow(16384) + 49152
-    # print("Transaction Id:", transaction_id)
-    # print("Source Port:", source_port)
 
-
-    # Construct DNS query
-    pkt = (
+    packet = (
         IP(src=source_ip, dst=dns_server) /
         UDP(sport=source_port, dport=53) /
         DNS(
@@ -56,52 +228,36 @@ def dnsFn(domain, dns_server="8.8.8.8", record_type="A", timeout=5):
         )
     )
 
-    # Send DNS query and measure latency
-    start = time.perf_counter()
-    res = sr1(pkt, timeout=timeout, verbose=0)
-    end = time.perf_counter()
+    response_packet, latency, send_error = send_packet(packet, timeout)
 
-    latency = round((end - start) * 1000, 2)
+    if send_error:
+        return make_failure(
+            f"Could not send DNS query: {send_error}",
+            response_valid=False,
+            latency_ms=latency,
+            answers=[]
+        )
 
-    # Handle timeout
-    if res is None:
-        return {
-            "success": False,
-            "response_valid": False,
-            "reason": "DNS server timeout",
-            "server": dns_server,
-            "domain": domain,
-            "latency_ms": None,
-            "answers": []
-        }
+    if response_packet is None:
+        return make_failure(
+            "DNS server did not respond before timeout",
+            response_valid=False,
+            server=dns_server,
+            domain=domain,
+            latency_ms=latency,
+            answers=[]
+        )
 
-    # Validate packet structure
-    if (
-        not res.haslayer(IP)
-        or not res.haslayer(UDP)
-        or not res.haslayer(DNS)
-    ):
-        return {
-            "success": False,
-            "response_valid": False,
-            "reason": "Unexpected response packet",
-            "server": dns_server,
-            "domain": domain,
-            "latency_ms": latency,
-            "answers": []
-        }
+    if not has_layers(response_packet, IP, UDP, DNS):
+        return make_failure(
+            "Received an unexpected response packet",
+            response_valid=False,
+            latency_ms=latency,
+            answers=[]
+        )
 
-    response = res[DNS]
-    # print(ls(response))
-    # normalize domain names for comparison
-    def normalize_name(name):
-        if isinstance(name, bytes):
-            name = name.decode("ascii", errors="replace")
-
-        return str(name).rstrip(".").lower()
-
-    # validate DNS question
-    question = response.qd
+    response = response_packet[DNS]
+    question = first_record(response.qd)
 
     question_valid = (
         question is not None
@@ -110,303 +266,364 @@ def dnsFn(domain, dns_server="8.8.8.8", record_type="A", timeout=5):
         and question.qclass == 1
     )
 
-    # Validate response
     checks = {
-        "source_ip": res[IP].src == dns_server,
-        "destination_ip": res[IP].dst == source_ip,
-        "source_port": res[UDP].sport == 53,
-        "destination_port": res[UDP].dport == source_port,
-        "dns_response": response.qr == 1,
+        "source_ip": response_packet[IP].src == dns_server,
+        "destination_ip": response_packet[IP].dst == source_ip,
+        "source_port": response_packet[UDP].sport == 53,
+        "destination_port": response_packet[UDP].dport == source_port,
+        "is_response": response.qr == 1,
         "transaction_id": response.id == transaction_id,
-        "opcode": response.opcode == pkt[DNS].opcode,
+        "opcode": response.opcode == packet[DNS].opcode,
         "question": question_valid
     }
 
-    # Reject invalid responses
     if not all(checks.values()):
-        return {
-            "success": False,
-            "response_valid": False,
-            "reason": "Invalid or mismatched DNS response",
-            "server": dns_server,
-            "domain": domain,
-            "latency_ms": latency,
-            "checks": checks,
-            "answers": []
-        }
+        return make_failure(
+            "DNS response did not pass validation",
+            response_valid=False,
+            server=dns_server,
+            domain=domain,
+            latency_ms=latency,
+            checks=checks,
+            answers=[]
+        )
 
-    # Handle truncated responses
-    if response.tc == 1:
-        return {
-            "success": False,
-            "response_valid": True,
-            "reason": "DNS response truncated. TCP fallback required.",
-            "server": dns_server,
-            "domain": domain,
-            "latency_ms": latency,
-            "checks": checks,
-            "answers": []
-        }
-
-    # Interpret DNS response codes
-    rcode_names = {
-        0: "NOERROR",
-        1: "FORMERR",
-        2: "SERVFAIL",
-        3: "NXDOMAIN",
-        4: "NOTIMP",
-        5: "REFUSED"
-    }
+    if response.tc:
+        return make_failure(
+            "DNS response was truncated; TCP fallback is not included in v1.0",
+            response_valid=True,
+            server=dns_server,
+            domain=domain,
+            latency_ms=latency,
+            checks=checks,
+            answers=[]
+        )
 
     rcode = response.rcode
     rcode_name = rcode_names.get(rcode, f"UNKNOWN ({rcode})")
 
-   
-    # Extract DNS answers
     answers = []
 
-    record_names = {
-        1: "A",
-        2: "NS",
-        5: "CNAME",
-        15: "MX",
-        16: "TXT",
-        28: "AAAA"
-    }
+    # Scapy exposes the answer section as a linked packet list.
+    # Iterating over it collects each answer record.
+    answer_record = response.an
+    while answer_record is not None and hasattr(answer_record, "type"):
+        record_type_name = record_names.get(
+            answer_record.type,
+            str(answer_record.type)
+        )
 
-    for record in response.an:
-
-        data = record.rdata
-
+        data = answer_record.rdata
         if isinstance(data, bytes):
             data = data.decode("utf-8", errors="replace")
 
         answers.append({
-            "name": normalize_name(record.rrname),
-            "type": record_names.get(record.type, str(record.type)),
-            "ttl": record.ttl,
+            "name": normalize_name(answer_record.rrname),
+            "type": record_type_name,
+            "ttl": answer_record.ttl,
             "data": str(data)
         })
 
+        answer_record = answer_record.payload
 
-    # Find answers matching the requested record type
+        # Stop when the payload is no longer another DNS answer record.
+        if not hasattr(answer_record, "type") or not hasattr(answer_record, "rrname"):
+            break
+
     matching_answers = [
         answer for answer in answers
         if answer["type"] == record_type
     ]
 
-    # Interpret DNS result
     if rcode == 3:
+        success = False
         reason = "Domain does not exist (NXDOMAIN)"
-        success = False
-
     elif rcode != 0:
+        success = False
         reason = f"DNS server returned {rcode_name}"
-        success = False
-
     elif not matching_answers:
-        reason = f"No {record_type} records found (possible NODATA)"
         success = False
-
+        reason = f"DNS replied successfully, but no {record_type} answer was found"
     else:
+        success = True
         reason = "DNS resolution successful"
-        success = True
 
-    return {
-        "success": success,
-        "response_valid": True,
-        "reason": reason,
-        "server": dns_server,
-        "domain": domain,
-        "record_type": record_type,
-        "rcode": rcode,
-        "rcode_name": rcode_name,
-        "latency_ms": latency,
-        "checks": checks,
-        "answers": answers
-    }
-
-
-# DNS tests
-# print("Starting DNS Diagnostics...")
-
-# print("\n--- GOOGLE A RECORD ---")
-# print(dnsFn("google.com"))
-
-# print("\n--- GOOGLE AAAA RECORD ---")
-# print(dnsFn("google.com", record_type="AAAA"))
-
-# print("\n--- NONEXISTENT DOMAIN ---")
-# print(dnsFn("network-doctor-test.invalid"))
-
-def pingFn(des):
-
-    route = conf.route.route(des)
-    source_ip = route[1]
-    if not source_ip or source_ip == "0.0.0.0":
-        return {
-            "success": False,
-            "reason": "no valid route",
-            "latency": None
-        }
-    
-    pkt = IP(src=source_ip,dst=des) / ICMP()
-
-    start = time.perf_counter()
-    res = sr1(pkt, timeout=5, verbose=0)
-    end = time.perf_counter()
-
-    # Handle timeout
-    if res is None:
-        return {
-            "success": False,
-            "reason": "timeout",
-            "latency": None
-        }
-
-    # Check packet structure
-    if not res.haslayer(IP) or not res.haslayer(ICMP):
-        return {
-            "success": False,
-            "reason": "unexpected packet",
-            "latency": None
-        }
-
-    # Validation Code
-    resDict = {"success": False, "checks": {}}
-    checks = {}
-
-    # IP validation
-    checks["ip"] = (
-        pkt[IP].src == res[IP].dst
-        and pkt[IP].dst == res[IP].src
+    return make_result(
+        success,
+        reason,
+        response_valid=True,
+        server=dns_server,
+        domain=domain,
+        record_type=record_type,
+        rcode=rcode,
+        rcode_name=rcode_name,
+        latency_ms=latency,
+        checks=checks,
+        answers=answers
     )
 
-    # ICMP validation
-    checks["icmp_type"] = res[ICMP].type == 0
-    checks["icmp_code"] = res[ICMP].code == 0
-    checks["id"] = pkt[ICMP].id == res[ICMP].id
-    checks["sequence"] = pkt[ICMP].seq == res[ICMP].seq
 
-    # Overall success
-    resDict["checks"] = checks
-    resDict["success"] = all(checks.values())
-    resDict["latency"] = f"{math.ceil((end - start) * 1000)}ms"
+# ============================================================
+# 3. TCP CONNECTION
+# ============================================================
 
-    return resDict
-
-def tcpFn(des, port=443, timeout=5):
-
-    route = conf.route.route(des)
-    source_ip = route[1]
-
-    if not source_ip or source_ip == "0.0.0.0":
-        return {
-            "success": False,
-            "reason": "no valid route",
-            "latency_ms": None
-        }
-
-    source_port = secrets.randbelow(16384) + 49152
-    sequence = secrets.randbelow(2**32)
-
-    pkt = (
-        IP(src=source_ip, dst=des) /
-        TCP(
-            sport=source_port,
-            dport=port,
-            flags="S",
-            seq=sequence
-        )
-    )
-
+def tcpFn(destination, port=HTTPS_PORT, timeout=DEFAULT_TIMEOUT):
     start = time.perf_counter()
-    res = sr1(pkt, timeout=timeout, verbose=0)
-    end = time.perf_counter()
 
-    latency = round((end - start) * 1000, 2)
+    try:
+        with socket.create_connection(
+            (destination, port),
+            timeout=timeout
+        ):
+            latency = round((time.perf_counter() - start) * 1000, 2)
 
-    if res is None:
-        return {
-            "success": False,
-            "response_valid": False,
-            "reason": "timeout",
-            "latency_ms": latency
-        }
-
-    if not res.haslayer(IP) or not res.haslayer(TCP):
-        return {
-            "success": False,
-            "response_valid": False,
-            "reason": "unexpected packet",
-            "latency_ms": latency
-        }
-
-    ip_res = res[IP]
-    tcp_res = res[TCP]
-
-    checks = {
-        "source_ip": ip_res.src == des,
-        "destination_ip": ip_res.dst == source_ip,
-        "source_port": tcp_res.sport == port,
-        "destination_port": tcp_res.dport == source_port,
-        "acknowledgment": tcp_res.ack == ((sequence + 1) % (2**32))
-    }
-
-
-    response_valid = all(checks.values())
-
-    if not response_valid:
-        reason = "invalid TCP response"
-        success = False
-
-    elif tcp_res.flags & 0x04:
-        reason = "connection refused (RST)"
-        success = False
-
-    elif (tcp_res.flags & 0x12) == 0x12:
-        reason = "TCP connection established (SYN-ACK)"
-        success = True
-
-        # Complete the handshake with the final ACK.
-        ack_pkt = (
-            IP(src=source_ip, dst=des) /
-            TCP(
-                sport=source_port,
-                dport=port,
-                flags="A",
-                seq=(sequence + 1) % (2**32),
-                ack=(tcp_res.seq + 1) % (2**32)
+            return make_result(
+                True,
+                "TCP connection established",
+                server=destination,
+                port=port,
+                latency_ms=latency
             )
+
+    except socket.timeout:
+        reason = "TCP connection timed out"
+    except ConnectionRefusedError:
+        reason = "Connection refused by destination"
+    except OSError as error:
+        reason = f"TCP connection error: {error}"
+
+    latency = round((time.perf_counter() - start) * 1000, 2)
+
+    return make_failure(
+        reason,
+        server=destination,
+        port=port,
+        latency_ms=latency
+    )
+
+
+# ============================================================
+# 4. TLS CONNECTION
+# ============================================================
+
+def tlsFn(destination, domain, port=HTTPS_PORT, timeout=DEFAULT_TIMEOUT):
+    context = ssl.create_default_context()
+
+    # Measure TCP connection and TLS setup together in v1.0.
+    # The field name makes clear that this is not TLS-only latency.
+    start = time.perf_counter()
+
+    try:
+        with socket.create_connection(
+            (destination, port),
+            timeout=timeout
+        ) as raw_socket:
+
+            raw_socket.settimeout(timeout)
+
+            with context.wrap_socket(
+                raw_socket,
+                server_hostname=domain
+            ) as tls_socket:
+
+                total_latency = round(
+                    (time.perf_counter() - start) * 1000,
+                    2
+                )
+
+                certificate = tls_socket.getpeercert()
+                cipher_info = tls_socket.cipher()
+
+                return make_result(
+                    True,
+                    "TLS handshake successful; certificate verification passed",
+                    server=destination,
+                    domain=domain,
+                    tls_version=tls_socket.version(),
+                    cipher=cipher_info[0] if cipher_info else None,
+                    certificate_verified=bool(certificate),
+                    connection_plus_tls_ms=total_latency
+                )
+
+    except ssl.SSLCertVerificationError as error:
+        reason = f"Certificate verification failed: {error}"
+    except ssl.SSLError as error:
+        reason = f"TLS handshake failed: {error}"
+    except socket.timeout:
+        reason = "TCP/TLS setup timed out"
+    except OSError as error:
+        reason = f"TCP/TLS connection error: {error}"
+
+    total_latency = round((time.perf_counter() - start) * 1000, 2)
+
+    return make_failure(
+        reason,
+        server=destination,
+        domain=domain,
+        connection_plus_tls_ms=total_latency
+    )
+
+
+# ============================================================
+# 5. DIAGNOSIS ENGINE
+# ============================================================
+
+def generate_diagnosis(results):
+    diagnosis = []
+
+    gateway = results["gateway"]
+    internet = results["internet"]
+    dns = results["dns"]
+    tcp = results["tcp"]
+    tls = results["tls"]
+
+    if not gateway["success"]:
+        diagnosis.append(
+            "The gateway did not answer the ICMP ping. "
+            "Check the local connection and gateway, but note that "
+            "some gateways block ping."
         )
-        print(ls(ack_pkt))
+
+    if not internet["success"]:
+        diagnosis.append(
+            "The external test IP did not answer ICMP. "
+            "External connectivity is not confirmed; ICMP filtering "
+            "could also explain this result."
+        )
+
+    if not dns["success"]:
+        diagnosis.append(
+            f"DNS lookup failed: {dns.get('reason', 'Unknown DNS error')}. "
+            "Check DNS server reachability, DNS settings, or filtering."
+        )
+
+    if dns["success"] and not tcp["success"]:
+        diagnosis.append(
+            f"DNS succeeded, but TCP to {tcp.get('server')}:{tcp.get('port')} "
+            f"failed: {tcp.get('reason')}. Check the destination service, "
+            "firewall, or route."
+        )
+
+    if tcp["success"] and not tls["success"]:
+        diagnosis.append(
+            "TCP succeeded, but TLS setup failed: "
+            f"{tls.get('reason')}. Investigate certificate trust, "
+            "hostname, system time, TLS compatibility, or interception."
+        )
+
+    if tls["success"]:
+        diagnosis.append(
+            "DNS, TCP, and TLS checks succeeded. The tested HTTPS "
+            "connection path is working. This does not yet test an HTTP response."
+        )
+
+    if not diagnosis:
+        diagnosis.append("No specific problem was identified by these checks.")
+
+    return diagnosis
 
 
-        send(ack_pkt, verbose=0)
+# ============================================================
+# 6. MAIN DIAGNOSTIC ENGINE
+# ============================================================
 
+def run_diagnostics(domain=TEST_DOMAIN):
+    print("\n" + "=" * 58)
+    print(f"NETWORK DOCTOR v1.0 — {domain}")
+    print("=" * 58)
+
+    results = {}
+
+    # Step 1: Find and test the default gateway.
+    print("\n[1/6] DEFAULT GATEWAY")
+
+    try:
+        gateway = conf.route.route("0.0.0.0")[2]
+    except (OSError, ValueError, IndexError):
+        gateway = None
+
+    if gateway and gateway != "0.0.0.0":
+        results["gateway"] = pingFn(gateway)
+        results["gateway"]["destination"] = gateway
     else:
-        reason = "unexpected TCP flags"
-        success = False
+        results["gateway"] = make_failure("No default gateway found")
 
-    return {
-        "success": success,
-        "response_valid": response_valid,
-        "reason": reason,
-        "server": des,
-        "port": port,
-        "latency_ms": latency,
-        "checks": checks,
-        "tcp_flags": str(tcp_res.flags)
-    }
-# HTTPS
-print(tcpFn("142.250.202.238", 443))
+    print_check("Gateway ping", results["gateway"])
 
-# HTTP
-# print(tcpFn("142.250.202.238", 80))
+    # Step 2: Test reachability of a known external IP.
+    print("\n[2/6] EXTERNAL IP REACHABILITY")
+    results["internet"] = pingFn(INTERNET_TEST_IP)
+    print_check(f"Ping {INTERNET_TEST_IP}", results["internet"])
 
-# A likely closed port
-# print(tcpFn("142.250.202.238", 65000))
-# print(pingFn(gateway))
-# print(f"Gateway IP: {gateway}")
-# print(pingFn(gateway))
-# print(pingFn("8.8.8.8"))
+    # Step 3: Resolve the requested domain.
+    print("\n[3/6] DNS")
+    results["dns"] = dnsFn(domain, record_type="A")
+    print_check("DNS A-record lookup", results["dns"])
+
+    # Select the first A record returned by DNS.
+    ip_address = None
+
+    if results["dns"]["success"]:
+        for answer in results["dns"].get("answers", []):
+            if answer["type"] == "A":
+                ip_address = answer["data"]
+                break
+
+    # Step 4 and 5: TCP, then TLS only if TCP succeeds.
+    if ip_address:
+        print("\n[4/6] TCP")
+        results["tcp"] = tcpFn(ip_address, HTTPS_PORT)
+        print_check(f"TCP {ip_address}:{HTTPS_PORT}", results["tcp"])
+
+        if results["tcp"]["success"]:
+            print("\n[5/6] TLS")
+            results["tls"] = tlsFn(ip_address, domain, HTTPS_PORT)
+            status = "PASS" if results["tls"]["success"] else "FAIL"
+            print(f"[{status}] TLS handshake")
+            print(f"       {results['tls']['reason']}")
+            if results["tls"]["success"]:
+                print(f"       Version: {results['tls']['tls_version']}")
+                print(f"       Cipher:  {results['tls']['cipher']}")
+                print(
+                    "       TCP + TLS setup: "
+                    f"{results['tls']['connection_plus_tls_ms']} ms"
+                )
+        else:
+            results["tls"] = make_failure(
+                "Skipped because the TCP connection failed"
+            )
+            print("\n[5/6] TLS")
+            print("[SKIP] TLS was not attempted because TCP failed.")
+    else:
+        results["tcp"] = make_failure(
+            "Skipped because DNS did not provide an IPv4 A record"
+        )
+        results["tls"] = make_failure(
+            "Skipped because DNS did not provide an IPv4 A record"
+        )
+
+        print("\n[4/6] TCP")
+        print("[SKIP] No IPv4 address available from DNS.")
+        print("\n[5/6] TLS")
+        print("[SKIP] No IPv4 address available from DNS.")
+
+    # Step 6: Interpret the collected evidence.
+    print("\n[6/6] DIAGNOSIS")
+    results["diagnosis"] = generate_diagnosis(results)
+
+    for item in results["diagnosis"]:
+        print(f"- {item}")
+
+    print("\n" + "=" * 58)
+    print("DIAGNOSTICS COMPLETED")
+    print("=" * 58)
+
+    return results
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    report = run_diagnostics()
